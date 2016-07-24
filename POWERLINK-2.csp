@@ -1,0 +1,333 @@
+﻿// Powerlink model in PAT 3.5.1
+// With Algorithm 2: improved D-HPF
+
+// Numbers of three kinds of nodes
+#define PRCNode_num 2;
+#define normalNode_num 2;
+#define multiplexedNode_num 2;
+#define CN_num 6;
+
+#define multiplexedCycle_num 2;		// The length of a multiplexed cycle
+
+// The beginning IDs of three kinds of nodes
+#define PRCNode_beginIndex  1;  
+#define normalNode_beginIndex PRCNode_num + 1;
+#define multiplexedNode_beginIndex PRCNode_num + normalNode_num + 1;
+
+// Elements of the messages
+enum
+{
+	MN, CN,
+	Soc, Preq, Pres, SoA, Asnd,
+	SendToAll, PRCPresTime,
+	unspecInvite, NMTInvite, noInvite,
+	PRC_responsTime,PRC_compelete, PRC_allComplete
+};
+
+// Note: the indexes used in the arrays start at 1
+channel Ethernet 0;
+var cycleCounter = 0;
+var multiplexed_cycleAssign = [0, 1, 2];		
+
+// MN：
+var MNPR3 = [0, 0, 0, 0, 0, 0, 0];			// Scheduling list of the MN
+var MNPR7 = [0, 0, 0, 0, 0, 0, 0];
+var CNPrio = [0, 1, 2, 3, 4, 5, 6];			// The priorities of the CNs
+
+// Temporary recordsets which record the updating information
+var needUpdate = [0, 0, 0, 0, 0, 0, 0];
+var updatePR = [-1, -1, -1, -1, -1, -1, -1];			// A PR (priority) value which is used to update the scheduling list of the MN
+var updateRS = [-1, -1, -1, -1, -1, -1, -1];			// An RS (RequestToSend) value which is used to update the scheduling list of the MN
+
+// The pending requests of CNs; The indexes of the arrays are request IDs
+var request_num = 6;
+var requestStart_time = [-1, 1(6)];				// Time information about when the requests start waiting to be scheduled (cycle number is used to represent the time unit)
+var requestComplete_time = [-1(7)];				// Time information about when the requests are scheduled completely 
+var requestCompleted_bool = [0(7)];	            // Whether the requests have been scheduled
+
+#define requestsQueue_capacity 12;
+var CNRequestsPR3[CN_num+1][requestsQueue_capacity+1] =	[0(13),						// The pending requests which are waiting in each CN's queue with priority 3
+														0, 0, 0(11),				// CN（1）
+														0, 0, 0(11),				// CN（2）
+														0, 0, 0(11),				// CN（3）
+														0, 1, 0(11),				// CN（4）
+														0, 2, 0(11),				// CN（5）
+														0, 3, 0(11)];				// CN（6）
+var CNRequestsPR7[CN_num+1][requestsQueue_capacity+1] =	[0(13),					// The pending requests which are waiting in each CN's queue with priority 7
+														0, 0, 0(11), 			// CN（1）
+														0, 0, 0(11),			// CN（2）
+														0, 0, 0(11), 		    // CN（3）
+														0, 4, 0(11),            // CN（4）
+														0, 5, 0(11),            // CN（5）
+														0, 6, 0(11)];           // CN（6）
+
+var CNPR3 = [0, 0, 0, 0, 1, 1, 1];					// The number of pending requests with priority 3 of each CN
+var CNPR7 = [0, 0, 0, 0, 1, 1, 1];					// The number of pending requests with priority 7 of each CN		
+
+var PRSend = 0;				// The value of PR and RS which is sent in the messages
+var RSSend = 0;
+var inviteTarget = -1;				// Which CN is allowed to transmit an asynchronous frame
+var inviteType = noInvite;			// The priority of the request which can be scheduled 
+
+// The processes of the MN
+PMN() = MN_syn();MN_asyn();
+ 
+// The PRC Nodes get time information from the MN 
+PRCTime() =		Ethernet?MN.Pres.PRCPresTime
+			->	Active_PRC(PRCNode_beginIndex);
+				Ethernet!PRC_allComplete
+				->	Skip;
+
+// Synchronous with the process PRC_CN to request a Pres frame from the PRC Node
+Active_PRC(i) =	Ethernet!PRC_responsTime.i
+			->	Ethernet?PRC_compelete.i
+			->	if(i==PRCNode_num) {Skip} else {Active_PRC(i+1)};
+             
+MN_syn() =	Ethernet!MN.Soc.SendToAll
+		->	MNCycleIncrease{cycleCounter = cycleCounter+1} 
+		->	Ethernet!MN.Pres.PRCPresTime
+		->	PRC_MN (PRCNode_beginIndex); 
+			(Ethernet?PRC_allComplete->Skip);
+			Normal_MN(normalNode_beginIndex);
+			Multiplexed_MN(multiplexedNode_beginIndex);
+
+PRC_MN(i) =		atomic{Ethernet?CN.i.Pres.PR.RS
+			->	UpdateOrnot(i, PR, RS);
+				if(i==PRCNode_num){Skip}else{PRC_MN(i+1)}};
+
+Normal_MN(i) =	Ethernet!MN.Preq.i 
+				->	atomic{Ethernet?CN.i.Pres.PR.RS
+				->	UpdateOrnot(i, PR, RS)};
+				if(i==PRCNode_num+normalNode_num){Skip}else{Normal_MN(i+1)};
+
+Multiplexed_MN(i) = if(multiplexed_cycleAssign[i-PRCNode_num-normalNode_num]%multiplexedCycle_num==cycleCounter%multiplexedCycle_num)
+					{
+						Ethernet!MN.Preq.i 
+					->	Ethernet?CN.i.Pres.PR.RS
+						-> UpdateOrnot(i, PR, RS)
+					}
+					else{Skip};
+					if (i == PRCNode_num+normalNode_num+multiplexedNode_num){Skip}
+					else {Multiplexed_MN(i+1)};
+                   
+// improved D-HPF	   
+MN_asyn() = ifa(cycleCounter % multiplexedCycle_num == 0)
+			{
+				MNupdateMNList
+				{
+					var index = 1;
+					while(index <= CN_num)
+					{
+						if(needUpdate[index] == 1)		// Whether it is necessary to update the list of MN
+						{
+							if(updatePR[index] == 3)
+							{
+								MNPR3[index] = updateRS[index]; 
+							}
+							
+							if(updatePR[index] == 7)
+							{
+								MNPR7[index]=updateRS[index];
+							}
+						}
+						index++;
+					}
+				}
+			->
+				MNSchedule
+				{
+					var index = 1;
+					var CNPrioTemp = -1;
+					inviteTarget = -1;
+					inviteType = noInvite;
+					var hasNMTSchedule = 0;
+					var hasGenSchedule = 0;
+					while(index<=CN_num)
+					{
+						if(MNPR7[index]!=0)
+						{
+							hasNMTSchedule = 1;
+							inviteType = NMTInvite;
+							if(CNPrio[index] > CNPrioTemp)
+							{
+								CNPrioTemp = CNPrio[index];
+								inviteTarget = index;
+							}
+						}
+						index++;
+					}
+
+					index = 1;
+					CNPrioTemp = -1;
+					if(hasNMTSchedule==0)			// Whether there's a request with priority 7
+					{
+						while(index<=CN_num)
+						{
+							if(MNPR3[index]!=0)
+							{
+								hasGenSchedule = 1;
+								inviteType = unspecInvite;
+								if(CNPrio[index] > CNPrioTemp)
+								{
+									CNPrioTemp = CNPrio[index];
+									inviteTarget = index;
+								}
+							}
+							index++;
+						}
+					}
+
+					if(inviteTarget!=-1)
+					{
+					 	if(inviteType == NMTInvite){MNPR7[inviteTarget]--}
+					 	if(inviteType == unspecInvite){MNPR3[inviteTarget]--}
+					}
+				}
+			->
+				Skip
+			}
+			else
+			{
+				resetInvite
+				{
+					inviteTarget = -1;
+					inviteType = noInvite;
+				}
+				->	Skip
+			};
+				Ethernet!MN.SoA.inviteTarget.inviteType
+			->	ifa (inviteTarget != -1){Ethernet?CN.i.Asnd -> Skip}
+				else{Skip};
+
+// The processes of CNs		   
+PCN() = CN_syn();CN_asyn();    
+CN_syn() = 	Ethernet?MN.Soc.SendToAll
+	     -> (|| x:{PRCNode_beginIndex..(PRCNode_beginIndex+PRCNode_num-1)} @PRC_CN (x))
+	     ||
+	        (|| x:{normalNode_beginIndex..(normalNode_beginIndex+normalNode_num-1)} @Normal_CN (x))
+	     ||
+	        (|| x:{multiplexedNode_beginIndex..(multiplexedNode_beginIndex+multiplexedNode_num-1)} @Multiplexed_CN(x));
+
+CN_asyn() = Ethernet?MN.SoA.invitedTarget.invitedType
+	     -> ifa(invitedTarget!=-1){CN_schedule(invitedTarget, invitedType)};
+         
+PRC_CN(i) =		atomic
+				{ 
+					Ethernet?PRC_responsTime.i
+				->	GetMaxPrio(i);
+					Ethernet!CN.i.Pres.PRSend.RSSend
+					->	Skip
+				};
+				Ethernet!PRC_compelete.i-> Skip;
+
+Normal_CN(i) =	atomic
+				{
+					Ethernet?MN.Preq.i 
+				->	GetMaxPrio(i);
+					Ethernet!CN.i.Pres.PRSend.RSSend
+					->	Skip
+				};
+
+Multiplexed_CN(i) =	ifa(multiplexed_cycleAssign[i-PRCNode_num-normalNode_num]%multiplexedCycle_num==cycleCounter%multiplexedCycle_num)
+					{
+						atomic
+						{
+							Ethernet?MN.Preq.i
+							->	GetMaxPrio(i)
+						};
+						Ethernet!CN.i.Pres.PRSend.RSSend
+						->	Skip
+					}
+		            else{Skip};
+
+// Update the pending requests in the queues 
+CN_schedule(i, invitedType) =	Ethernet!CN.i.Asnd 
+							->	updateCNList
+								{
+									if(invitedType == unspecInvite)
+									{
+										CNPR3[i]--;
+										var RequestID = CNRequestsPR3[i][1];		// The request ID at the head of the queue
+										requestCompleted_bool[RequestID] = 1;			
+										requestComplete_time[RequestID] = cycleCounter;
+										CNRequestsPR3[i][1] = 0;			
+										var index = 0;
+										while(index < requestsQueue_capacity)		
+										{
+											CNRequestsPR3[i][index] = CNRequestsPR3[i][index+1];
+											index++;
+										}
+										CNRequestsPR3[i][requestsQueue_capacity] = 0;
+									}
+									if (invitedType == NMTInvite)
+									{
+										CNPR7[i]--;
+										var RequestID = CNRequestsPR7[i][1];
+										requestCompleted_bool[RequestID] = 1;			
+										requestComplete_time[RequestID] = cycleCounter;
+										CNRequestsPR7[i][1] = 0;			
+										var index=0;
+										while(index < requestsQueue_capacity)
+										{
+											CNRequestsPR7[i][index] = CNRequestsPR7[i][index+1];
+											index++;
+										}
+										CNRequestsPR7[i][requestsQueue_capacity] = 0;
+									}
+								}
+								->	Skip;
+         
+
+GetMaxPrio(i) =	CNfindMaxPrio
+			{
+				if(CNPR7[i]!=0)
+				{
+					PRSend = 7;
+					RSSend = CNPR7[i];
+				}
+				else if(CNPR3[i]!=0)
+				{
+					PRSend = 3;
+					RSSend = CNPR3[i];
+				}
+				else
+				{
+					PRSend = 0;
+					RSSend = 0;
+				}
+			}
+			-> Skip;
+
+// Check whether it is necessary to update the scheduling list in this cycle
+UpdateOrnot(i, pr,rs) =	MNwhetherUpdate
+						{
+							if(pr == 3)
+							{
+								if(rs==MNPR3[i]) {needUpdate[i] = 0}
+								else {needUpdate[i] = 1; updatePR[i]=pr; updateRS[i]= rs} 
+							}
+							else if(pr == 7)
+							{
+								if(rs==MNPR7[i]) {needUpdate[i] = 0}
+								else {needUpdate[i] = 1; updatePR[i]=pr; updateRS[i]= rs}
+							}
+							else
+							{
+								needUpdate[i] = 0; updatePR[i] = -1; updateRS[i]= -1			   		
+							}
+						}
+						->	Skip;
+
+Powerlink() = (PMN() || PCN() || PRCTime());Powerlink();
+
+#define schedule_complete	CNPR7[1] == 0 && CNPR7[2] == 0 && CNPR7[3] == 0 && CNPR7[4] == 0 && CNPR7[5] == 0 && CNPR7[6] == 0			
+							&& CNPR3[1] == 0 && CNPR3[2] == 0 && CNPR3[3] == 0 && CNPR3[4] == 0 && CNPR3[5] == 0 && CNPR3[6] == 0;	
+
+#define maintainPrio	(requestComplete_time[1] > requestComplete_time[2] && requestComplete_time[2] > requestComplete_time[3] && requestComplete_time[3] > requestComplete_time[4]
+						&& requestComplete_time[4] > requestComplete_time[5] && requestComplete_time[5] > requestComplete_time[6])
+					&& 
+						(requestCompleted_bool[1] == 1 && requestCompleted_bool[2] == 1 && requestCompleted_bool[3] == 1 && requestCompleted_bool[4] == 1 && requestCompleted_bool[5] == 1 && requestCompleted_bool[6] == 1);	
+#assert Powerlink() reaches schedule_complete;
+#assert Powerlink() reaches maintainPrio;
+#assert Powerlink() deadlockfree;			// It cannot be directly verified. Use "Tools -> Options -> State Searching Upper Bound" to verify it is deadlock free within n states in the simulation.
+
